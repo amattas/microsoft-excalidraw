@@ -865,6 +865,10 @@ def _make_line_element(out_pts, closed, fill, opacity, group_id, rel_key, idx, d
     minx, miny, maxx, maxy = _bbox(out_pts)
     w, h = maxx - minx, maxy - miny
     points = [[x - minx, y - miny] for x, y in out_pts]
+    # Every emitted element is a filled shape, and SVG fills paths via implicit
+    # closure even without Z — close the polygon so Excalidraw's fill and any
+    # dark outline don't gap along the implicit edge.
+    closed = closed or len(points) >= 3
     if closed and points and points[0] != points[-1]:
         points.append([points[0][0], points[0][1]])
     if closed and len(points) >= 2:

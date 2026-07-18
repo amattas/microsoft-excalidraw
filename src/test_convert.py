@@ -179,6 +179,16 @@ def test_hole_composites_translucent_layers():
     assert hole["opacity"] == 100
 
 
+def test_unclosed_filled_path_is_closed():
+    """SVG fills paths via implicit closure even without Z (e.g. the Web Jobs
+    disk); the emitted polygon must close so fills and outlines don't gap."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
+           '<path d="M1,1 L17,1 L9,17" fill="#ff0000"/></svg>')
+    els, _ = c.convert_text(svg, "open-fill")
+    pts = els[0]["points"]
+    assert pts[0] == pts[-1]
+
+
 def test_hole_fallback_white():
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
            '<path d="M2,2 H16 V16 H2 Z M6,6 H12 V12 H6 Z" fill="#ff0000"/></svg>')
