@@ -189,11 +189,95 @@ def test_unclosed_filled_path_is_closed():
     assert pts[0] == pts[-1]
 
 
+def test_hole_reemits_covered_interior_art():
+    """Badge icons draw interior art first and a ring last; the ring's hole
+    fill must not flatten the art — it takes the color beneath the art and the
+    art is re-emitted on top of the hole."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
+           '<rect x="7" y="7" width="4" height="4" fill="#ff0000"/>'
+           '<path d="M2,2 H16 V16 H2 Z M4,4 H14 V14 H4 Z" fill="#0000ff"/></svg>')
+    els, cnt = c.convert_text(svg, "ring-over-art")
+    assert cnt == 4  # 3 subpaths + 1 re-emitted copy of the red square
+    assert len(els) == 4
+    art, outer, hole, dup = els
+    assert hole["backgroundColor"] == "#ffffff"   # beneath the art, not red
+    assert dup["backgroundColor"] == "#ff0000"    # art restored on top
+    assert dup["type"] == art["type"] == "rectangle"
+    assert dup["id"] != art["id"]                 # distinct element identity
+
+
+def test_root_fill_none_inherited():
+    """Fluent/Fabric icons set fill="none" on the root svg; stroke-only paths
+    must not fall back to filled black shapes."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="none">'
+           '<path d="M5,5 H35 V35 H5 Z" fill="#ffffff"/>'
+           '<path stroke="#888" d="M5,5 H35 V35 H5 Z"/></svg>')
+    els, cnt = c.convert_text(svg, "root-fill-none")
+    assert cnt == 1 and len(els) == 1        # stroke-only path dropped
+    assert els[0]["backgroundColor"] == "#ffffff"
+
+
+def test_hole_fill_majority_ignores_partial_crossing():
+    """Art crossing partially through a hole (orbit rings) must not tint the
+    whole hole; the fill takes the majority color of the hole area."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
+           '<rect x="8" y="0" width="2" height="18" fill="#ff0000"/>'
+           '<path d="M4,4 H14 V14 H4 Z M6,6 H12 V12 H6 Z" fill="#0000ff"/></svg>')
+    els, _ = c.convert_text(svg, "ring-crossing")
+    hole = els[-1]
+    assert hole["backgroundColor"] == "#ffffff"  # not #ff0000 from the centroid
+
+
 def test_hole_fallback_white():
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
            '<path d="M2,2 H16 V16 H2 Z M6,6 H12 V12 H6 Z" fill="#ff0000"/></svg>')
     els, _ = c.convert_text(svg, "hole-white")
     assert els[1]["backgroundColor"] == "#ffffff"
+
+
+def test_css_class_fill():
+    """Azure icons style shapes via <style> classes; class fills must resolve
+    instead of defaulting to black."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
+           '<defs><style>.cls-1{fill:#0078d4;}</style></defs>'
+           '<rect class="cls-1" x="2" y="2" width="10" height="10"/></svg>')
+    els, _ = c.convert_text(svg, "css-class")
+    assert els[0]["backgroundColor"] == "#0078d4"
+
+
+@pytest.mark.parametrize("stops,expected_opacity", [
+    # uniform 50% stop-opacity -> element at 50%
+    ('<stop offset="0" stop-color="#112233" stop-opacity=".5"/>'
+     '<stop offset="1" stop-color="#112233" stop-opacity=".5"/>', 50),
+    # fabric shading overlay: colorless stops fading .2 -> 0 (mid ~9%)
+    ('<stop stop-opacity=".2"/><stop offset="1" stop-opacity="0"/>', 10),
+])
+def test_gradient_stop_opacity(stops, expected_opacity):
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18"><defs>'
+           f'<linearGradient id="g">{stops}</linearGradient></defs>'
+           '<rect x="2" y="2" width="10" height="10" fill="url(#g)"/></svg>')
+    els, _ = c.convert_text(svg, "grad-alpha")
+    assert els[0]["opacity"] == expected_opacity
+
+
+def test_fully_rounded_rect_is_ellipse():
+    """rx == w/2 turns a rect into a circle (Language Understanding disk)."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
+           '<rect width="18" height="18" rx="9" fill="#0078d4"/></svg>')
+    e = c.convert_text(svg, "round-rect-full")[0][0]
+    assert e["type"] == "ellipse"
+    assert e["width"] == pytest.approx(18 * c.OUTSCALE)
+
+
+def test_partially_rounded_rect_keeps_corner_radius():
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
+           '<rect x="1" y="1" width="16" height="10" rx="2" fill="#0078d4"/></svg>')
+    e = c.convert_text(svg, "round-rect-part")[0][0]
+    assert e["type"] == "line"                     # flattened rounded outline
+    assert len(e["points"]) > 12                   # corner arcs sampled
+    assert e["width"] == pytest.approx(16 * c.OUTSCALE, abs=0.1)
+    # no point may sit in the sharp corner outside the rounding
+    assert not any(px < 0.5 and py < 0.5 for px, py in e["points"])
 
 
 # --------------------------------------------------------------------------- #
@@ -269,10 +353,11 @@ def test_time_series_outline_consistent_per_source_path(idx, expect_dark):
     "azure/iot/Time Series Data Sets.svg",
 ])
 def test_no_silent_drops_invariant(rel):
-    """Emitted element count must equal the independently counted subpaths."""
+    """Emitted element count must equal the independently counted subpaths
+    plus any re-emitted hole-covered copies."""
     doc = c.SvgDoc((SRC / rel).read_text())
-    els, _ = c.build_elements(doc, rel)
-    assert len(els) == c.count_drawable_subpaths(doc)
+    els, _, dups = c.build_elements(doc, rel)
+    assert len(els) == c.count_drawable_subpaths(doc) + dups
 
 
 def test_element_schema_fields():

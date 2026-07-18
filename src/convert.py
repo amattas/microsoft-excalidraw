@@ -130,6 +130,22 @@ def interpolate_gradient(stops, at=0.5):
     return stops[-1][1]
 
 
+def _interp_scalar(stops, at=0.5):
+    """stops: list of (offset, value). Linearly interpolate the value at `at`."""
+    if not stops:
+        return 1.0
+    stops = sorted(stops, key=lambda s: s[0])
+    if at <= stops[0][0]:
+        return stops[0][1]
+    if at >= stops[-1][0]:
+        return stops[-1][1]
+    for (o0, v0), (o1, v1) in zip(stops, stops[1:]):
+        if o0 <= at <= o1:
+            t = 0.0 if o1 == o0 else (at - o0) / (o1 - o0)
+            return v0 + (v1 - v0) * t
+    return stops[-1][1]
+
+
 # --------------------------------------------------------------------------- #
 # Affine transforms (2x3: a b c d e f mapping x'=a*x+c*y+e, y'=b*x+d*y+f)
 # --------------------------------------------------------------------------- #
@@ -477,19 +493,32 @@ def _style_dict(style):
     return out
 
 
+_CSS_CLASS_RULE = re.compile(r"\.([\w-]+)\s*\{([^}]*)\}")
+
+
 class SvgDoc:
     def __init__(self, text):
         self.root = ET.fromstring(text)
         self.gradients = {}
-        self._collect_gradients(self.root)
+        self.class_styles = {}
+        self._collect_defs(self.root)
 
-    def _collect_gradients(self, node):
+    def _collect_defs(self, node):
         for el in node.iter():
             name = _localname(el.tag)
             if name in ("linearGradient", "radialGradient"):
                 gid = el.get("id")
                 if gid:
                     self.gradients[gid] = el
+            elif name == "style" and el.text:
+                for cls, body in _CSS_CLASS_RULE.findall(el.text):
+                    self.class_styles.setdefault(cls, {}).update(_style_dict(body))
+
+    def class_props(self, class_attr):
+        props = {}
+        for cname in (class_attr or "").split():
+            props.update(self.class_styles.get(cname, {}))
+        return props
 
     def _gradient_stops(self, el, _seen=None):
         _seen = _seen or set()
@@ -505,7 +534,12 @@ class SvgDoc:
                 style = _style_dict(child.get("style"))
                 col = child.get("stop-color") or style.get("stop-color") or "#000000"
                 hexc = parse_color(col) or "#000000"
-                stops.append((offv, hexc))
+                op = child.get("stop-opacity") or style.get("stop-opacity")
+                try:
+                    alpha = 1.0 if op is None else max(0.0, min(1.0, float(op)))
+                except ValueError:
+                    alpha = 1.0
+                stops.append((offv, hexc, alpha))
         if not stops:
             href = el.get("{http://www.w3.org/1999/xlink}href") or el.get("href")
             if href and href.startswith("#"):
@@ -514,20 +548,29 @@ class SvgDoc:
                     return self._gradient_stops(ref, _seen)
         return stops
 
-    def resolve_fill(self, value):
-        """Resolve a fill value (possibly url(#id)) to #rrggbb or None."""
+    def resolve_paint(self, value):
+        """Resolve a fill value (possibly url(#id)) to (#rrggbb or None, alpha).
+
+        Gradient paints resolve to the interpolated color AND opacity at offset
+        0.5 — fabric shading overlays are near-transparent gradients that must
+        not become solid bands."""
         col = parse_color(value)
         if col is None:
-            return None
+            return None, 1.0
         if col.startswith("url("):
             m = re.match(r"url\(#([^)]+)\)", col)
-            if not m:
-                return "#000000"
-            grad = self.gradients.get(m.group(1))
+            grad = self.gradients.get(m.group(1)) if m else None
             if grad is None:
-                return "#000000"
-            return interpolate_gradient(self._gradient_stops(grad), 0.5)
-        return col
+                return "#000000", 1.0
+            stops = self._gradient_stops(grad)
+            color = interpolate_gradient([(o, c) for o, c, _ in stops], 0.5)
+            alpha = _interp_scalar([(o, a) for o, _, a in stops], 0.5)
+            return color, alpha
+        return col, 1.0
+
+    def resolve_fill(self, value):
+        """Resolve a fill value (possibly url(#id)) to #rrggbb or None."""
+        return self.resolve_paint(value)[0]
 
 
 DRAWABLE_TAGS = {"path", "rect", "circle", "ellipse", "polygon", "polyline", "line"}
@@ -548,17 +591,26 @@ def iter_drawables(doc):
             if name in SKIP_SUBTREE_TAGS:
                 continue
             style = _style_dict(child.get("style"))
+            cls = doc.class_props(child.get("class"))
+
+            def prop(key, _s=style, _c=cls, _n=child):
+                # CSS-ish precedence: inline style > class rule > attribute
+                v = _s.get(key)
+                if v is None:
+                    v = _c.get(key)
+                if v is None:
+                    v = _n.get(key)
+                return v
+
             cmat = mat_mul(matrix, parse_transform(child.get("transform")))
             cop = opacity
-            op_attr = child.get("opacity") or style.get("opacity")
+            op_attr = prop("opacity")
             if op_attr is not None:
                 try:
                     cop = opacity * float(op_attr)
                 except ValueError:
                     pass
-            fill = child.get("fill")
-            if fill is None:
-                fill = style.get("fill")
+            fill = prop("fill")
             fill = fill if fill is not None else fill_inherited
             if name == "g":
                 walk(child, cmat, cop, fill)
@@ -569,13 +621,17 @@ def iter_drawables(doc):
                     "matrix": cmat,
                     "opacity": cop,
                     "fill": fill,
-                    "fill_opacity": child.get("fill-opacity") or style.get("fill-opacity"),
+                    "fill_opacity": prop("fill-opacity"),
                 })
             else:
                 # unknown container (e.g. <a>): descend
                 walk(child, cmat, cop, fill)
 
-    walk(doc.root, IDENTITY, 1.0, None)
+    root_style = _style_dict(doc.root.get("style"))
+    root_fill = doc.root.get("fill")
+    if root_fill is None:
+        root_fill = root_style.get("fill")
+    walk(doc.root, IDENTITY, 1.0, root_fill)
     return results
 
 
@@ -606,9 +662,36 @@ def primitive_subpaths(item):
         subs = [([tp(x, y) for (x, y) in pts], closed) for pts, closed in raw]
         return subs, None
 
+    def ellipse_result(cx, cy, rx, ry):
+        pts = []
+        n = 64
+        for i in range(n + 1):
+            t = 2 * math.pi * i / n
+            pts.append(tp(cx + rx * math.cos(t), cy + ry * math.sin(t)))
+        if axis:
+            sx = math.hypot(m[0], m[1])
+            sy = math.hypot(m[2], m[3])
+            ccx, ccy = tp(cx, cy)
+            rxo, ryo = rx * sx, ry * sy
+            return [(pts, True)], ("ellipse", (ccx - rxo, ccy - ryo, 2 * rxo, 2 * ryo))
+        return [(pts, True)], None
+
     if kind == "rect":
         x, y = _num(node, "x"), _num(node, "y")
         w, h = _num(node, "width"), _num(node, "height")
+        rx = _num(node, "rx") if node.get("rx") is not None else None
+        ry = _num(node, "ry") if node.get("ry") is not None else None
+        if rx is None:
+            rx = ry
+        if ry is None:
+            ry = rx
+        rx = 0.0 if rx is None else max(0.0, min(rx, w / 2.0))
+        ry = 0.0 if ry is None else max(0.0, min(ry, h / 2.0))
+        if rx > 0 and ry > 0:
+            if rx >= w / 2.0 - 1e-9 and ry >= h / 2.0 - 1e-9:
+                return ellipse_result(x + w / 2.0, y + h / 2.0, rx, ry)
+            pts = [tp(px, py) for px, py in _rounded_rect_pts(x, y, w, h, rx, ry)]
+            return [(pts, True)], None
         corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
         tc = [tp(px, py) for px, py in corners]
         if axis:
@@ -622,18 +705,7 @@ def primitive_subpaths(item):
             rx = ry = _num(node, "r")
         else:
             rx, ry = _num(node, "rx"), _num(node, "ry")
-        pts = []
-        n = 64
-        for i in range(n + 1):
-            t = 2 * math.pi * i / n
-            pts.append(tp(cx + rx * math.cos(t), cy + ry * math.sin(t)))
-        if axis:
-            sx = math.hypot(m[0], m[1])
-            sy = math.hypot(m[2], m[3])
-            ccx, ccy = tp(cx, cy)
-            rxo, ryo = rx * sx, ry * sy
-            return [(pts, True)], ("ellipse", (ccx - rxo, ccy - ryo, 2 * rxo, 2 * ryo))
-        return [(pts, True)], None
+        return ellipse_result(cx, cy, rx, ry)
 
     if kind in ("polygon", "polyline"):
         nums = [float(x) for x in re.findall(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?", node.get("points", ""))]
@@ -650,6 +722,22 @@ def primitive_subpaths(item):
         return [([tp(x1, y1), tp(x2, y2)], False)], None
 
     return [], None
+
+
+def _rounded_rect_pts(x, y, w, h, rx, ry, n=6):
+    """Clockwise outline of a rounded rect, corner arcs sampled with n steps."""
+    def arc(cx, cy, a0, a1):
+        for i in range(n + 1):
+            t = math.radians(a0 + (a1 - a0) * i / n)
+            yield (cx + rx * math.cos(t), cy + ry * math.sin(t))
+
+    pts = []
+    pts.extend(arc(x + w - rx, y + ry, -90, 0))        # top-right corner
+    pts.extend(arc(x + w - rx, y + h - ry, 0, 90))     # bottom-right
+    pts.extend(arc(x + rx, y + h - ry, 90, 180))       # bottom-left
+    pts.extend(arc(x + rx, y + ry, 180, 270))          # top-left
+    pts.append(pts[0])
+    return pts
 
 
 # --------------------------------------------------------------------------- #
@@ -725,16 +813,23 @@ def _det_uuid(seed_str):
 
 
 def build_elements(doc, rel_key):
-    """Return the list of Excalidraw element dicts for one icon."""
+    """Return (elements, group_id, n_duplicates) for one icon.
+
+    n_duplicates counts re-emitted copies of earlier elements that a hole fill
+    would otherwise flatten (badge icons draw interior art first and the ring
+    last; the hole's opaque fill must not cover the art).
+    """
     drawables = iter_drawables(doc)
     group_id = _det_uuid(rel_key + "|group")
     elements = []
-    # emitted polygons (output coords) + fill, for hole color lookup
+    # emitted layers (output polygon, fill, opacity, element) for hole lookup
     emitted_polys = []
     idx = 0
+    dup_count = 0
 
     for item in drawables:
-        fill_hex = doc.resolve_fill(item["fill"] if item["fill"] is not None else "#000000")
+        fill_hex, fill_alpha = doc.resolve_paint(
+            item["fill"] if item["fill"] is not None else "#000000")
         fo = item.get("fill_opacity")
         if fill_hex is None:
             continue  # fill:none -> not a drawable
@@ -743,7 +838,7 @@ def build_elements(doc, rel_key):
         if not subs:
             continue
 
-        op = item["opacity"]
+        op = item["opacity"] * fill_alpha
         if fo is not None:
             try:
                 op *= float(fo)
@@ -803,28 +898,71 @@ def build_elements(doc, rel_key):
             is_hole = containment[i][0]
             out_pts = out_polys[i]
             if is_hole:
-                fill = _hole_fill(interiors[i], below)
+                # earlier elements sitting fully inside the hole would be
+                # flattened by its opaque fill: sample the color as if they
+                # weren't there, then repaint copies of them on top
+                covered = [rec for rec in below
+                           if _poly_inside(rec[0], out_pts)]
+                keep = [rec for rec in below
+                        if not any(rec is cov for cov in covered)]
+                fill = _hole_fill(out_pts, interiors[i], keep)
                 elem = _make_line_element(out_pts, closed, fill, opacity, group_id, rel_key, idx, item_dark)
             elif native is not None and len(subs) == 1:
+                covered = []
                 shape, geom = native
                 sgeom = tuple(v * OUTSCALE for v in geom)
                 elem = _make_native_element(shape, sgeom, fill_hex, opacity, group_id, rel_key, idx)
             else:
+                covered = []
                 elem = _make_line_element(out_pts, closed, fill_hex, opacity, group_id, rel_key, idx, item_dark)
             elements.append(elem)
             emitted_polys.append((out_pts,
                                   fill_hex if not is_hole else elem["backgroundColor"],
-                                  elem["opacity"]))
+                                  elem["opacity"], elem))
             idx += 1
+            for poly, color, layer_op, covered_elem in covered:
+                dup = dict(covered_elem)
+                dup["id"] = _det_uuid(f"{rel_key}|{idx}|id")
+                dup["seed"] = _det_int(f"{rel_key}|{idx}|seed", 2 ** 31)
+                dup["versionNonce"] = _det_int(f"{rel_key}|{idx}|nonce", 2 ** 31)
+                elements.append(dup)
+                emitted_polys.append((poly, color, layer_op, dup))
+                idx += 1
+                dup_count += 1
 
-    return elements, group_id
+    return elements, group_id, dup_count
 
 
-def _hole_fill(sample, below):
+def _poly_inside(poly, container):
+    """True when every vertex of poly lies inside the container polygon."""
+    return bool(poly) and all(point_in_poly(p, container) for p in poly)
+
+
+def _hole_fill(hole_poly, fallback_sample, below):
+    """Majority composited color over the hole's area, so art crossing
+    partially through the hole (orbit rings) doesn't tint all of it."""
+    samples = _hole_samples(hole_poly) or [fallback_sample]
+    votes = Counter(_composite_at(p, below) for p in samples)
+    return votes.most_common(1)[0][0]
+
+
+def _hole_samples(hole_poly, grid=5):
+    minx, miny, maxx, maxy = _bbox(hole_poly)
+    pts = []
+    for iy in range(grid):
+        for ix in range(grid):
+            p = (minx + (maxx - minx) * (ix + 0.5) / grid,
+                 miny + (maxy - miny) * (iy + 0.5) / grid)
+            if point_in_poly(p, hole_poly):
+                pts.append(p)
+    return pts
+
+
+def _composite_at(sample, below):
     """Composite every layer covering `sample` bottom-up over white, honoring
     each layer's opacity (a 20% sheen must blend, not replace)."""
     color = (255.0, 255.0, 255.0)
-    for poly, layer_color, layer_op in below:
+    for poly, layer_color, layer_op, _elem in below:
         if point_in_poly(sample, poly):
             a = layer_op / 100.0
             rgb = _hex_to_rgb(layer_color)
@@ -1016,8 +1154,8 @@ def make_icon_json(elements):
 
 def convert_text(text, rel_key):
     doc = SvgDoc(text)
-    elements, _ = build_elements(doc, rel_key)
-    return elements, count_drawable_subpaths(doc)
+    elements, _, dups = build_elements(doc, rel_key)
+    return elements, count_drawable_subpaths(doc) + dups
 
 
 def make_lib(items):
