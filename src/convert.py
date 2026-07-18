@@ -28,8 +28,9 @@ SRC_ROOT = OUT_ROOT / "src" / "icons"
 ICONS_OUT = OUT_ROOT / "icons"
 LIB_OUT = OUT_ROOT / "microsoft-icons.excalidrawlib"
 
-# 18x18 source viewBox rendered at ~96px to match the existing library scale.
-OUTSCALE = 96.0 / 18.0
+# Every icon is normalized so its content bounding box has this max dimension,
+# regardless of source viewBox units (azure 18, generic 48, power-platform 96).
+TARGET_SIZE = 96.0
 # Flatness tolerance for curve subdivision, in source units.
 # Sketchiness knobs. Excalidraw's wobble is clamped per segment, so denser
 # points = cleaner lines. Coarser FLATNESS + higher ROUGHNESS = more scribble.
@@ -798,8 +799,8 @@ def _bbox(points):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _scale_pts(points):
-    return [(x * OUTSCALE, y * OUTSCALE) for x, y in points]
+def _scale_pts(points, scale):
+    return [(x * scale, y * scale) for x, y in points]
 
 
 def _det_int(seed_str, mod):
@@ -827,17 +828,29 @@ def build_elements(doc, rel_key):
     idx = 0
     dup_count = 0
 
+    # prepare pass: resolve fills/geometry, then derive the per-icon scale that
+    # normalizes the content bounding box to TARGET_SIZE
+    prepared = []
     for item in drawables:
         fill_hex, fill_alpha = doc.resolve_paint(
             item["fill"] if item["fill"] is not None else "#000000")
-        fo = item.get("fill_opacity")
         if fill_hex is None:
             continue  # fill:none -> not a drawable
         subs, native = primitive_subpaths(item)
         subs = [(pts, closed) for pts, closed in subs if len(pts) >= 2]
         if not subs:
             continue
+        prepared.append((item, fill_hex, fill_alpha, subs, native))
 
+    all_pts = [p for _, _, _, subs, _ in prepared for pts, _ in subs for p in pts]
+    if not all_pts:
+        return [], group_id, 0
+    minx, miny, maxx, maxy = _bbox(all_pts)
+    span = max(maxx - minx, maxy - miny)
+    scale = TARGET_SIZE / span if span > 1e-9 else 1.0
+
+    for item, fill_hex, fill_alpha, subs, native in prepared:
+        fo = item.get("fill_opacity")
         op = item["opacity"] * fill_alpha
         if fo is not None:
             try:
@@ -851,7 +864,7 @@ def build_elements(doc, rel_key):
 
         # classify holes: a closed subpath contained in an odd number of the
         # element's other closed subpaths
-        out_polys = [_scale_pts(pts) for pts, _ in subs]
+        out_polys = [_scale_pts(pts, scale) for pts, _ in subs]
         interiors = [interior_point(p) for p in out_polys]
 
         # Outline decision is consistent per source path: a compound path (more
@@ -910,7 +923,7 @@ def build_elements(doc, rel_key):
             elif native is not None and len(subs) == 1:
                 covered = []
                 shape, geom = native
-                sgeom = tuple(v * OUTSCALE for v in geom)
+                sgeom = tuple(v * scale for v in geom)
                 elem = _make_native_element(shape, sgeom, fill_hex, opacity, group_id, rel_key, idx)
             else:
                 covered = []

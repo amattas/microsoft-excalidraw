@@ -266,7 +266,7 @@ def test_fully_rounded_rect_is_ellipse():
            '<rect width="18" height="18" rx="9" fill="#0078d4"/></svg>')
     e = c.convert_text(svg, "round-rect-full")[0][0]
     assert e["type"] == "ellipse"
-    assert e["width"] == pytest.approx(18 * c.OUTSCALE)
+    assert e["width"] == pytest.approx(c.TARGET_SIZE)
 
 
 def test_partially_rounded_rect_keeps_corner_radius():
@@ -275,13 +275,13 @@ def test_partially_rounded_rect_keeps_corner_radius():
     e = c.convert_text(svg, "round-rect-part")[0][0]
     assert e["type"] == "line"                     # flattened rounded outline
     assert len(e["points"]) > 12                   # corner arcs sampled
-    assert e["width"] == pytest.approx(16 * c.OUTSCALE, abs=0.1)
+    assert e["width"] == pytest.approx(c.TARGET_SIZE, abs=0.1)  # 16x10 bbox
     # no point may sit in the sharp corner outside the rounding
     assert not any(px < 0.5 and py < 0.5 for px, py in e["points"])
 
 
 # --------------------------------------------------------------------------- #
-# Native primitive scaling
+# Native primitive scaling / size normalization
 # --------------------------------------------------------------------------- #
 def test_rect_becomes_scaled_rectangle():
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">'
@@ -289,9 +289,11 @@ def test_rect_becomes_scaled_rectangle():
     els, _ = c.convert_text(svg, "rect-test")
     e = els[0]
     assert e["type"] == "rectangle"
-    assert e["x"] == pytest.approx(1 * c.OUTSCALE)
-    assert e["width"] == pytest.approx(4 * c.OUTSCALE)
-    assert e["height"] == pytest.approx(6 * c.OUTSCALE)
+    # content bbox is 4x6 -> normalized so the max dimension is TARGET_SIZE
+    scale = c.TARGET_SIZE / 6
+    assert e["x"] == pytest.approx(1 * scale)
+    assert e["width"] == pytest.approx(4 * scale)
+    assert e["height"] == pytest.approx(c.TARGET_SIZE)
 
 
 def test_circle_becomes_ellipse():
@@ -299,7 +301,21 @@ def test_circle_becomes_ellipse():
            '<circle cx="9" cy="9" r="4" fill="#123456"/></svg>')
     e = c.convert_text(svg, "circle-test")[0][0]
     assert e["type"] == "ellipse"
-    assert e["width"] == pytest.approx(8 * c.OUTSCALE)
+    assert e["width"] == pytest.approx(c.TARGET_SIZE)
+
+
+@pytest.mark.parametrize("viewbox,shape", [
+    ("0 0 18 18", '<rect x="1" y="1" width="16" height="16" fill="#123456"/>'),
+    ("0 0 96 96", '<rect x="4" y="4" width="88" height="88" fill="#123456"/>'),
+])
+def test_output_size_normalized_across_source_units(viewbox, shape):
+    """An 18-unit azure icon and a 96-unit power-platform icon must come out
+    the same size on canvas."""
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{viewbox}">'
+           f'{shape}</svg>')
+    e = c.convert_text(svg, f"norm-{viewbox}")[0][0]
+    assert e["width"] == pytest.approx(c.TARGET_SIZE)
+    assert e["height"] == pytest.approx(c.TARGET_SIZE)
 
 
 # --------------------------------------------------------------------------- #
